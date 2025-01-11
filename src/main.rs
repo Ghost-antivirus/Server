@@ -1,5 +1,6 @@
 use rand::{self, thread_rng, Rng};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::{
     io::{self, Write},
     sync::{Arc, Mutex},
@@ -11,7 +12,8 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream}
 };
-use std::string::String;
+
+type AuthorizedClients = Arc<Mutex<HashMap<String, TcpStream>>>;
 
 struct User {
     password: String,
@@ -26,6 +28,15 @@ struct UserDatabase {
 struct Message {
     command: String,
     data: Option<serde_json::Value>,
+}
+
+impl Clone for Message {
+    fn clone(&self) -> Self {
+        Message {
+            command: self.command.clone(),
+            data: self.data.clone(),
+        }
+    }
 }
 
 impl UserDatabase {
@@ -119,78 +130,90 @@ fn get_token(database: &UserDatabase, username: String) -> Option<String> {
     None
 }
 
-fn auth_user(database: Arc<Mutex<UserDatabase>>, msg: Message) -> Message {
+fn auth_user(database: Arc<Mutex<UserDatabase>>, msg: Message) -> Result<Message, Message> {
     let data = match msg.data {
         Some(serde_json::Value::Object(map)) => map,
-        _ => return Message {
+        _ => return Err(Message {
             command: "auth".to_string(),
             data: Some(serde_json::json!({"status": "err", "message": "Expected JSON object in 'data' field."})),
-        },
+        }),
     };
 
     let username = match data.get("username") {
         Some(serde_json::Value::String(username)) => username,
-        _ => return Message {
+        _ => return Err(Message {
             command: "auth".to_string(),
             data: Some(serde_json::json!({"status": "err", "message": "Field 'username' is missing or has the wrong type."})),
-        },
+        }),
     };
 
     let password = match data.get("password") {
         Some(serde_json::Value::String(password)) => password,
-        _ => return Message {
+        _ => return Err(Message {
             command: "auth".to_string(),
             data: Some(serde_json::json!({"status": "err", "message": "The 'password' field is missing or has the wrong type."})),
-        },
+        }),
     };
 
     let db = database.lock().unwrap();
     if let Some(token) = get_token(&db, username.to_string()) {
-        return Message {
+        return Ok(Message {
             command: "auth".to_string(),
             data: Some(serde_json::json!({"status": "ok", "message": token})),
-        };
+        });
     }
     drop(db);
 
     let mut db = database.lock().unwrap();
     match auth(&mut db, username.to_string(), password.to_string()) {
-        Some(token) => Message {
-            command: "auth".to_string(),
-            data: Some(serde_json::json!({"status": "ok", "message": token})),
-        },
-        None => Message {
+        Some(token) => Ok(Message {
+                command: "auth".to_string(),
+                data: Some(serde_json::json!({"status": "ok", "message": token})),
+            }),
+        None => Err(Message {
             command: "auth".to_string(),
             data: Some(serde_json::json!({"status": "err", "message": "Invalid username or password."})),
-        },
+        }),
     }
 }
 
-// fn message_handler(database: Arc<Mutex<UserDatabase>>, msg: Message) {
-//     let db = database.lock().unwrap();
-//     match if let Some(token_value) = serde_json::to_string(&msg.data).get("token") {
-//         if let Some(token_str) = token_value.as_str() {
-//             db.find_user_by_token(token_str);
-//         } else {
-//             println!("Token не является строкой.");
-//         }
-//     } {
-//         Some(_) => todo!(),
-//         None => todo!(),
-//     }
-// }
+fn message_handler(
+    database: Arc<Mutex<UserDatabase>>,
+    msg: Message,
+) -> Result<Message, Box<dyn std::error::Error>> {
+    if let Some(data) = &msg.data {
+        if let Some(data_object) = data.as_object() {
+            if let Some(token_value) = data_object.get("token") {
+                if let Some(token) = token_value.as_str() {
+                    let db = database.lock().unwrap();
+                    if let Some(user) = db.find_user_by_token(token) {
+                        let username = user.clone();
+                        return Ok(Message {
+                            command: msg.command,
+                            data: Some(json!({"sender": username, "msg": data.clone()})),
+                        });
+                    } else {
+                        return Err("Token is invalid.".into());
+                    }
+                }
+            }
+        }
+        return Err("Token missing or data is not an object.".into());
+    }
+    Err("No data in message.".into())
+}
 
 fn database_manage(users: Arc<Mutex<UserDatabase>>) {
     println!("Запущена программа управления базы пользователей.\n");
 
     loop {
         println!("Выберите режим работы:");
-        println!("1. list - Выводит список пользователей. Можно вызвать 'list'.");
-        println!("2. add - Добавляет пользователя. Можно вызвать 'add <username> <password>'.");
-        println!("3. auth - Возвращает/генерирует токен (ключ сессии). Можно вызвать 'auth <username> <password>'.");
-        println!("4. logout - Удаляет токен у соответствующего пользователя. Можно вызвать 'logout <username/token>'.");
-        println!("5. del - Удаляет пользователя. Можно вызвать 'del <username>'.");
-        println!("6. gettoken - Получает токен пользователя. Можно вызвать 'gettoken <username>'.");
+        println!("1. list - Выводит список пользователей.");
+        println!("2. add <username> <password> - Добавляет пользователя.");
+        println!("3. auth <username> <password> - Возвращает/генерирует токен (ключ сессии).");
+        println!("4. logout <username/token> - Удаляет токен у соответствующего пользователя.");
+        println!("5. del <username> - Удаляет пользователя.");
+        println!("6. gettoken <username> - Получает токен пользователя.");
         println!("0. exit - для выхода.");
         print!(">>> ");
 
@@ -200,7 +223,7 @@ fn database_manage(users: Arc<Mutex<UserDatabase>>) {
         let input = input.trim();
         let parts: Vec<&str> = input.split_whitespace().collect();
         print!("\x1B[2J\x1B[1;1H");
-        std::io::stdout().flush().unwrap();
+        io::stdout().flush().unwrap();
 
         let mut db = users.lock().unwrap();
         match parts.as_slice() {
@@ -240,54 +263,86 @@ fn database_manage(users: Arc<Mutex<UserDatabase>>) {
     }
 }
 
-async fn handle_client(mut socket: TcpStream, addr: std::net::SocketAddr, database: Arc<Mutex<UserDatabase>>) {
+async fn handle_client(
+    mut socket: TcpStream,
+    addr: std::net::SocketAddr,
+    database: Arc<Mutex<UserDatabase>>,
+    clients: AuthorizedClients,
+) {
     let mut buf = vec![0; 1024];
     println!("Клиент подключился: {}", addr);
 
+    let username: Option<String> = None;
+    
     loop {
         let n = match socket.read(&mut buf).await {
             Ok(n) if n == 0 => {
                 println!("Клиент {} отключился.", addr);
+                if let Some(username) = &username {
+                    clients.lock().unwrap().remove(username);
+                }
                 return;
             }
             Ok(n) => n,
             Err(e) => {
                 eprintln!("Ошибка при чтении от клиента {}: {:?}", addr, e);
+                if let Some(username) = &username {
+                    clients.lock().unwrap().remove(username);
+                }
                 return;
             }
         };
 
-        let msg: Message = match serde_json::from_slice(&buf[..n]) {
-            Ok(msg) => msg,
-            Err(e) => {
-                eprintln!("Ошибка преобразования JSON от клиента {}: {:?}", addr, e);
-                continue;
+        let Ok(msg) = serde_json::from_slice::<Message>(&buf[..n]) else {
+            eprintln!("Ошибка преобразования JSON от клиента.");
+            continue;
+        };
+        
+        match msg.command.as_str() {
+            "auth" => { 
+                let response = match auth_user(database.clone(), msg.clone()) {
+                    Ok(msg) => {
+                        if let Some(name) = username.clone() { 
+                            clients.lock().unwrap().insert(name, socket);
+                        } else {
+                            eprintln!("Ошибка: имя пользователя отсутствует.");
+                        }
+                        
+                        msg},
+                    Err(msg) => msg,
+                };
+                let Ok(response_json) = serde_json::to_vec(&response) else {
+                    eprintln!("Ошибка преобразования JSON для клиента.");
+                    continue;
+                };
+                if let Err(e) = socket.write_all(&response_json).await {
+                    eprintln!("Ошибка при отправке данных клиенту {}: {:?}", addr, e);
+                    return;
+                }
             }
-        };
-
-        let response = match msg.command.as_str() {
-            "auth" => auth_user(database.clone(), msg),
-            "message" => Message {
-                command: "message".to_string(),
-                data: msg.data.clone(),
-            },
-            _ => Message {
-                command: "error".to_string(),
-                data: Some(serde_json::json!({"message": "Unknown command"})),
-            },
-        };
-
-        let response_json = match serde_json::to_vec(&response) {
-            Ok(json) => json,
-            Err(e) => {
-                eprintln!("Ошибка преобразования JSON для клиента {}: {:?}", addr, e);
-                continue;
+            "message" => {
+                match message_handler(database.clone(), msg) {
+                    Ok(response) => {
+                        let serialized = serde_json::to_vec(&response).unwrap();
+                        let mut clients_guard = clients.lock().unwrap();
+                        for (_, client_socket) in clients_guard.iter_mut() {
+                            if let Err(e) = client_socket.write_all(&serialized).await {
+                                eprintln!("Ошибка при отправке сообщения клиенту: {:?}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Ошибка обработки сообщения: {:?}", e);
+                        if let Some(username) = &username {
+                            clients.lock().unwrap().remove(username);
+                        }
+                        return;
+                    }
+                }
             }
-        };
-
-        if let Err(e) = socket.write_all(&response_json).await {
-            eprintln!("Ошибка при отправке данных клиенту {}: {:?}", addr, e);
-            return;
+            _ => {
+                eprintln!("Неизвестная команда от клиента {}: {:?}", addr, msg.command);
+            }
         }
     }
 }
@@ -295,6 +350,7 @@ async fn handle_client(mut socket: TcpStream, addr: std::net::SocketAddr, databa
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let users = Arc::new(Mutex::new(UserDatabase::new()));
+    let clients = Arc::new(Mutex::new(HashMap::new()));
     let listener = TcpListener::bind("127.0.0.1:8080").await?;
     println!("Сервер запущен на 127.0.0.1");
     let users_manage = users.clone();
@@ -308,14 +364,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match timeout(Duration::from_secs(2), listener.accept()).await {
             Ok(Ok((socket, addr))) => {
                 let users_clone = users.clone();
-                tokio::spawn(handle_client(socket, addr, users_clone));
+                let clients_clone = clients.clone();
+                tokio::spawn(handle_client(socket, addr, users_clone, clients_clone));
             }
             Ok(Err(e)) => {
                 eprintln!("Ошибка при подключении: {:?}", e);
             }
             Err(_) => {
                 print!("");
-            }
+            }  
         }
     } 
 }
